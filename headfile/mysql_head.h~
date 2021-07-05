@@ -1,0 +1,556 @@
+#ifndef _ANALYSIS_MYSQL
+#define _ANALYSIS_MYSQL
+
+#include <pcap.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+
+typedef struct{
+        long number;//长度编码的指示器所指示的长度数值
+        short bytes;//长度编码的指示器本身所占的字节数
+}NUMBER_AND_BYTES;
+NUMBER_AND_BYTES number_and_bytes;
+
+#endif
+
+//payload被定义成包含包头的整个包的头指针*/
+void server_greeting(u_char *payload,FILE *fp)
+{
+	u_char * handshake=payload+4;//跳过包头4字节
+	u_char * version_info=handshake+1;
+	u_char * capability_of_server_low=NULL;
+	u_char * capability_of_server_high=NULL;
+	int bytes_of_version_info=0;
+
+	fprintf(fp,"协议版本号：%d\n",*handshake);
+
+	/*计算服务器版本信息所占的字节数*/
+	while((*version_info)!='\0'){
+		version_info++;
+		bytes_of_version_info++;
+	};
+	bytes_of_version_info++;
+
+	capability_of_server_low=handshake+bytes_of_version_info+14;//权能位低16位
+	capability_of_server_high=capability_of_server_low+5;//权能位高16位
+
+	/*下面展示如何判断server的压缩位是否被置位，想要判断其他位，依着做就可以*/
+        #define CAN_USE_COMPRESSION 0x20
+        if(((*(unsigned short *)capability_of_server_low) & CAN_USE_COMPRESSION) == CAN_USE_COMPRESSION){
+                fprintf(fp,"compression set\n");
+        }else{
+		fprintf(fp,"compression not set\n");	
+	}
+
+}
+
+void authenticate(u_char *payload,FILE *fp)
+{
+	u_char *auth=payload+4;
+
+	int username_size=1;
+	u_char * username=auth+32;
+	unsigned long password_size=0;
+	u_char * password;
+
+	/*计算用户名长度*/
+	while((*username)!='\0'){
+		username++;
+		username_size++;
+	}
+
+	/*计算挑战认证数据长度*/
+	password=++username;
+	/*password_size算出来暂时没什么用*/
+	if((*password)<251){
+		password_size=*password;
+	}else if((*password)==0xfc){
+		password_size=*((short *)(password+1));
+	}else if((*password)==0xfd){
+		password_size=(*((int *)(password+1)))&0xffffff;//the number in next 3 bytes;
+	}else{
+		password_size=*((long *)(password+1));//the number in next 8 bytes;
+	}
+		
+	#define CONNECT_WITH_DB 0x08 //此标志位置位的话，那么报文中就会有数据库名称的信息
+	if(((*((unsigned int *)auth)) & CONNECT_WITH_DB) == CONNECT_WITH_DB){
+		if((*password)<251)fprintf(fp,"%s\n",password+1+password_size);
+		if((*password)==0xfc)fprintf(fp,"%s\n",password+1+2+password_size);
+		if((*password)==0xfd)fprintf(fp,"%s\n",password+1+3+password_size);
+		if((*password)==0xfe)fprintf(fp,"%s\n",password+1+8+password_size);
+	}	
+
+	#define USE_COMPRESSION 0X20 	
+	if(((*((unsigned int *)auth)) & USE_COMPRESSION) == USE_COMPRESSION){
+		fprintf(fp,"compression set\n"); 
+	}
+}
+
+
+void print_sql(u_char *text,FILE *fp,int DB_TYPE,int IS_COMPRESS,u_char *src_ip,u_char *SRC_PORT,
+	u_char *dst_ip,u_char *DST_PORT,long op_time,u_char *seq_number,u_char *ack_number,int dir)
+{
+	u_char *visitor_ip=NULL;
+	u_char *visitor_port=NULL;
+	u_char *db_ip=NULL;
+	u_char *db_port=NULL;
+	if(dir==1){
+		visitor_ip=src_ip;
+		visitor_port=SRC_PORT;
+		db_ip=dst_ip;	
+		db_port=DST_PORT;
+	}else if(dir==2){
+		visitor_ip=dst_ip;
+		visitor_port=DST_PORT;
+		db_ip=src_ip;	
+		db_port=SRC_PORT;
+	}
+	/*操作时间,访问者ip,访问者端口，数据库ip,数据库端口,DB类型，方向，序号,确认号，压缩*/
+	fprintf(fp,"%ld|||%02x%02x%02x%02x|||%02x%02x|||%02x%02x%02x%02x|||%02x%02x|||%d|||%d|||%d%d%d%d|||%d%d%d%d|||%d|||",
+								    op_time,
+								*visitor_ip,*(visitor_ip+1),*(visitor_ip+2),*(visitor_ip+3),
+								*visitor_port,*(visitor_port+1),
+								*db_ip,*(db_ip+1),*(db_ip+2),*(db_ip+3),
+								*db_port,*(db_port+1),
+								DB_TYPE,
+								dir,
+	       *seq_number,*(seq_number+1),*(seq_number+2),*(seq_number+3),
+	       *ack_number,*(ack_number+1),*(ack_number+2),*(ack_number+3),
+								IS_COMPRESS);
+								
+	
+	/*用户名,数据库名,表名,操作类型（sql语句首单词）,操作语句*/
+	fprintf(fp,"SAB|||");
+	fprintf(fp,"database_name|||");
+	fprintf(fp,"table_name|||");
+	/*输出sql语句首单词*/
+	u_char *p=text;
+	while((*p)!=' '){
+		fprintf(fp,"%c",*p);
+		p++;
+	}   
+	/*输出整个sql语句*/
+	fprintf(fp,"|||%s",text);
+	fprintf(fp,"\n");
+	/*释放堆区资源*/
+	free(text);
+}
+void print_result_set(void **all_arr,FILE *fp,u_char *src_ip,u_char *dst_ip,long op_time,u_char *seq_number,u_char *ack_number)
+{
+	u_char **field_attr=all_arr[0];
+	u_char * (*table_p)[255+1]=all_arr[1];
+	int i,j;
+
+	fprintf(fp,"%ld|||%d.%d.%d.%d|||%d.%d.%d.%d|||%d%d%d%d|||%d%d%d%d|||",
+								    op_time,
+				*src_ip,*(src_ip+1),*(src_ip+2),*(src_ip+3),
+				*dst_ip,*(dst_ip+1),*(dst_ip+2),*(dst_ip+3),
+		*seq_number,*(seq_number+1),*(seq_number+2),*(seq_number+3),
+		*ack_number,*(ack_number+1),*(ack_number+2),*(ack_number+3));
+	fprintf(fp,"%s|||%s|||",field_attr[0],field_attr[1]);
+
+	fprintf(fp,"SAB|||");
+	fprintf(fp,"response|||");
+
+	for(i=0;table_p[i][0]!=NULL;i++){
+		for(j=0;table_p[i][j]!=NULL;j++){
+			fprintf(fp,"%s",table_p[i][j]);
+			if(table_p[i][j+1]!=NULL){
+                                fprintf(fp,"&&&");//字段分隔
+                        }else{
+                                fprintf(fp,"$$$");//记录分隔
+                        }
+		}   
+	}
+	fprintf(fp,"\n");
+	/*释放堆区资源*/
+	free(field_attr[0]);
+	free(field_attr[1]);
+	for(i=0;table_p[i][0]!=NULL;i++){
+                for(j=0;table_p[i][j]!=NULL;j++){
+                        free(table_p[i][j]);
+                }
+        }
+}		
+
+void com_quit(u_char * com_body,int com_length,FILE *fp)
+{
+}
+void com_init_db(u_char * com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"切换数据库为：");
+	while(com_length>0){
+		fprintf(fp,"%c",*com_body);
+		com_body++;
+		com_length--;
+	}		
+	fprintf(fp,"\n");
+}
+/*接受命令正文和命令正文长度
+void com_query(u_char * com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"sql语句：");
+	while(com_length>0){
+		fprintf(fp,"%c",*com_body);
+		com_body++;
+		com_length--;
+	}		
+	fprintf(fp,"\n");
+}	
+*/
+/*接受命令正文和命令正文长度*/
+void *com_query(u_char * com_body,int com_length)
+{
+	u_char *text=(u_char *)malloc(com_length+1);
+	if(text==NULL){
+		printf("malloc fail\n");
+	}
+	memset(text,0,com_length+1);
+	/*拷贝sql语句，跳过可能的换行符*/
+	u_char *p=text;
+	while(com_length>0){
+		if(*com_body!='\n'){
+			*p=*com_body;
+			p++;
+		}
+		com_body++;
+		com_length--;
+	}		
+	*p='\0';
+	return text;
+}	
+void com_field_list(u_char *com_body,int com_length,FILE *fp)
+{
+	int table_name_length=0;
+	int field_name_length=0;
+	/*输出表格名称*/
+	fprintf(fp,"table name:");
+	while(*com_body!='\0'){
+		fprintf(fp,"%c",*com_body);
+		com_body++;
+		table_name_length++;
+	}
+	fprintf(fp,"\n");
+	/*输出字段名称*/
+	table_name_length++;
+	com_body++;
+	field_name_length=com_length-table_name_length;	
+	fprintf(fp,"field name:");
+	while(field_name_length>0){
+		fprintf(fp,"%c",*com_body);
+		com_body++;
+		field_name_length--;
+	}
+	fprintf(fp,"\n");
+}
+/*该消息已过时*/
+void com_create_db(u_char *com_body,int com_length,FILE *fp)
+{
+
+}
+/*该消息已过时*/
+void com_drop_db(u_char *com_body,int com_length,FILE *fp)
+{
+
+}
+void com_refresh(u_char *com_body,int com_length,FILE *fp)
+{
+	#define REFRESH_GRANT 0x01
+	#define REFRESH_LOG 0x02
+	#define REFRESH_TABLES 0x04
+	#define REFRESH_HOSTS 0x08
+	#define REFRESH_STATUS 0x10
+	#define REFRESH_THREADS 0x20
+	#define REFRESH_SLAVE 0x40
+	#define REFRESH_MASTER 0x80
+
+	if(((*com_body)&REFRESH_GRANT)==REFRESH_GRANT){
+		fprintf(fp,"REFRESH_GRANT set\n");
+	}
+	if(((*com_body)&REFRESH_LOG)==REFRESH_LOG){
+		fprintf(fp,"REFRESH_LOG set\n");
+	}
+	if(((*com_body)&REFRESH_TABLES)==REFRESH_TABLES){
+		fprintf(fp,"REFRESH_TABLES set\n");
+	}
+	if(((*com_body)&REFRESH_HOSTS)==REFRESH_HOSTS){
+		fprintf(fp,"REFRESH_HOSTS set\n");
+	}
+	if(((*com_body)&REFRESH_STATUS)==REFRESH_STATUS){
+		fprintf(fp,"REFRESH_STATUS set\n");
+	}
+	if(((*com_body)&REFRESH_THREADS)==REFRESH_THREADS){
+		fprintf(fp,"REFRESH_THREADS set\n");
+	}
+	if(((*com_body)&REFRESH_SLAVE)==REFRESH_SLAVE){
+		fprintf(fp,"REFRESH_SLAVE set\n");
+	}
+	if(((*com_body)&REFRESH_MASTER)==REFRESH_MASTER){
+		fprintf(fp,"REFRESH_MASTER set\n");
+	}
+}
+void com_shutdown(u_char *com_body,int com_length,FILE *fp)
+{
+	#define SHUTDOWN_DEFAULT 0x00
+	#define SHUTDOWN_WAIT_CONNECTIONS 0x01
+	#define SHUTDOWN_WAIT_TRANSACTIONS 0x02
+	#define SHUTDOWN_WAIT_UPDATES 0X08
+	#define SHUTDOWN_WAIT_ALL_BUFFERS 0x10
+	#define SHUTDOWN_WAIT_CRITICAL_BUFFERS 0x11
+	#define KILL_QUERY 0Xfe
+	#define KILL_CONNECTION 0Xff
+
+	if(((*com_body)&SHUTDOWN_DEFAULT)==SHUTDOWN_DEFAULT){
+		fprintf(fp,"SHUTDOWN_DEFAULT set\n");
+	}
+	if(((*com_body)&SHUTDOWN_WAIT_CONNECTIONS)==SHUTDOWN_WAIT_CONNECTIONS){
+		fprintf(fp,"SHUTDOWN_WAIT_CONNECTIONS set\n");
+	}
+	if(((*com_body)&SHUTDOWN_WAIT_TRANSACTIONS)==SHUTDOWN_WAIT_TRANSACTIONS){
+		fprintf(fp,"SHUTDOWN_WAIT_TRANSACTIONS set\n");
+	}
+	if(((*com_body)&SHUTDOWN_WAIT_UPDATES)==SHUTDOWN_WAIT_UPDATES){
+		fprintf(fp,"SHUTDOWN_WAIT_UPDATES set\n");
+	}
+	if(((*com_body)&SHUTDOWN_WAIT_ALL_BUFFERS)==SHUTDOWN_WAIT_ALL_BUFFERS){
+		fprintf(fp,"SHUTDOWN_WAIT_ALL_BUFFERS set\n");
+	}
+	if(((*com_body)&SHUTDOWN_WAIT_CRITICAL_BUFFERS)==SHUTDOWN_WAIT_CRITICAL_BUFFERS){
+		fprintf(fp,"SHUTDOWN_WAIT_CRITICAL_BUFFERS set\n");
+	}
+	if(((*com_body)&KILL_QUERY)==KILL_QUERY){
+		fprintf(fp,"KILL_QUERY set\n");
+	}
+	if(((*com_body)&KILL_CONNECTION)==KILL_CONNECTION){
+		fprintf(fp,"KILL_CONNECTION set\n");
+	}
+}
+void com_statistics(u_char *com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"com_statistics\n");
+}
+void com_process_info(u_char *com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"com_process_info\n");
+}	
+void com_process_kill(u_char *com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"%u\n",*((int *)com_body));
+}
+void com_debug(u_char *com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"com_debug\n");
+}
+void com_ping(u_char *com_body,int com_length,FILE *fp)
+{
+	fprintf(fp,"com_ping\n");
+}
+void com_change_user(u_char *com_body,int com_length,FILE *fp)
+{
+	//密码字段有疑问
+}
+void com_binlog_dump(u_char *com_body,int com_length,FILE *fp)
+{
+	//该消息是备份时,由从服务器向主服务器发送的请求
+	//不是客户端发往服务器的，所以暂时不实现
+}
+void com_table_dump(u_char *com_body,int com_length,FILE *fp)
+{
+	//该消息已过时，不再使用
+}
+void com_register_slave(u_char *com_body,int com_length,FILE *fp)
+{
+	//此消息用于从服务器向主服务器发送注册消息
+}
+void com_prepare(u_char *com_body,int com_length,FILE *fp)
+{
+	//这就是com_query啊
+	fprintf(fp,"预处理sql语句：");
+	while(com_length>0){
+		fprintf(fp,"%c",*com_body);
+		com_body++;
+		com_length--;
+	}
+	fprintf(fp,"\n");
+}
+void com_execute(u_char *com_body,int com_length,FILE *fp)
+{
+	//经试验这还是com_query
+}
+void com_long_data(u_char *com_body,int com_length,FILE *fp)
+{
+	//我不知道什么命令用到这个消息
+}
+void com_close_stmt(u_char *com_body,int com_length,FILE *fp)
+{
+	//也是com_query
+}
+
+//长度指示器就是指示长度的token，长度编码的长度指示器就是此token本身的长度就是不固定的，这样其可以指示更大范围的长度
+//此函数接受一个长度编码指示器，返回其所指示的长度和它本身所占的字节数
+NUMBER_AND_BYTES length_coded_analysis(u_char *p)
+{
+        if((*p)<251){
+                number_and_bytes.number=*p;
+                number_and_bytes.bytes=1;
+	}else if((*p)==0xfb){
+		number_and_bytes.number=0;
+		number_and_bytes.bytes=1;
+        }else if((*p)==0xfc){
+                number_and_bytes.number=*((short *)(p+1));//the number in next 2 bytes
+                number_and_bytes.bytes=1+2;
+        }else if((*p)==0xfd){
+                number_and_bytes.number=(*((int *)(p+1)))&0xffffff;//the number in next 3 bytes
+                number_and_bytes.bytes=1+3;
+        }else{
+                number_and_bytes.number=*((long *)(p+1));//the number in next 8 bytes
+                number_and_bytes.bytes=1+8;
+        }
+        return number_and_bytes;
+}
+void * field_analysis(u_char * field_body)
+{
+	#define DB_NAME 0
+	#define TB_NAME 1
+	#define FIELD_NAME 2
+	static u_char *field_attr[5]={NULL,NULL,NULL,NULL,NULL};
+        int i;
+	/*跳过field的第一个属性*/
+        number_and_bytes=length_coded_analysis(field_body);
+        field_body=field_body+number_and_bytes.bytes+number_and_bytes.number;
+	/*输出field的第二个属性即数据库名*/
+        number_and_bytes=length_coded_analysis(field_body);
+        field_body=field_body+number_and_bytes.bytes;
+	field_attr[DB_NAME]=(u_char *)malloc(number_and_bytes.number+1);
+	u_char *db_name=field_attr[DB_NAME];
+        for(i=0;i<number_and_bytes.number;i++){
+		*db_name=*field_body;
+                field_body++;
+		db_name++;
+        }
+	*db_name='\0';
+	/*输出field的第三个属性即表名*/
+        number_and_bytes=length_coded_analysis(field_body);
+        field_body=field_body+number_and_bytes.bytes;
+	field_attr[TB_NAME]=(u_char *)malloc(number_and_bytes.number+1);
+	u_char *tb_name=field_attr[TB_NAME];
+        for(i=0;i<number_and_bytes.number;i++){
+		*tb_name=*field_body;
+                field_body++;
+		tb_name++;
+        }
+	*tb_name='\0';
+	return field_attr;
+}
+/*分析一条记录，返回一个指针数组，每个元素分别指向这条记录中的各字段*/
+void * rowdata_analysis(u_char *rowdata_body,long text_number)
+{
+	int i;
+	static u_char *text_p_arr[255+1];//这里假定一条记录不会超过255个字段	
+	for(i=0;i<text_number;i++){
+		number_and_bytes=length_coded_analysis(rowdata_body);	
+		rowdata_body=rowdata_body+number_and_bytes.bytes;
+		u_char *p=text_p_arr[i]=(u_char *)malloc(number_and_bytes.number+1);	
+		for(;number_and_bytes.number>0;number_and_bytes.number--){
+                        *p=*rowdata_body;
+                        rowdata_body++;
+			p++;
+                }
+		*p='\0';
+	}
+	//text_p_arr[i]=NULL;
+	return text_p_arr;
+}
+int if_eof(u_char * p)
+{
+	if((*(p+4)==0xfe)&&(((*(int *)p)&0xffffff)<=5))
+		return 0;//是eof报文
+	return 1;//不是eof报文
+}
+/*result_set报文*/     
+/*result指向resultset报文的numberoffield字段（token）,此token指示有多少个field报文,其本身是长度编码的*/
+void * result_set(u_char *result)
+{
+	u_char *field_packet;
+	u_char *eof_packet;
+	u_char *rowdata_packet;
+        unsigned long field_number;
+        unsigned long text_number;
+	/*计算result指向的长度指示器token所指示的长度以及其本身所占的字节数*/
+	number_and_bytes=length_coded_analysis(result);
+	text_number=field_number=number_and_bytes.number;//text_number用于下面分析row data报文
+	if(text_number>255){
+		printf("too many fields");
+	}
+	field_packet=result+number_and_bytes.bytes;
+	/*分析第一个field报文，从field报文中获得数据库和表的名称*/
+	void *field_attr=field_analysis(field_packet+4);
+	/*跳过余下的所有field报文*/
+	while(field_number>0){
+		field_packet=field_packet+4+((*((int*)field_packet))&0xffffff);
+		field_number--;
+	}
+	/*此时field_packet指向eof报文*/
+	/*这里暂不分析eof报文直接跳过*/
+	rowdata_packet=field_packet+9;
+	/*这里分析row data报文*/
+	/*row data报文的个数并无明确指示，只是用eof报文作为结束，这就要求我们每次分析输出row data报文的时候先判断
+ 	  有没有到eof报文，如果到了则row data报文分析结束。*/
+	/*一个row data报文内部的text个数等于字段field的个数，所以我们根据field_number循环打印field_number个text*/
+
+	/*循环解析全部记录*/
+	u_char **text_p_arr=NULL;
+	static u_char *table_p[1024+1][255+1];
+	int i=0;
+	int j=0;
+	while(if_eof(rowdata_packet)){
+		text_p_arr=rowdata_analysis(rowdata_packet+4,text_number);
+		/*将一条记录中的所有字段的指针复制到二维指针数组table_p中*/
+		for(j=0;text_p_arr[j]!=NULL;j++){
+			table_p[i][j]=text_p_arr[j];	
+		}
+	//	table_p[i][j]=NULL;
+		i++;
+		rowdata_packet=rowdata_packet+4+((*((int*)rowdata_packet))&0xffffff);
+	}
+	//table_p[i][0]=NULL;
+	/*到此，table_p中存储了一张表中的所有字段值的指针*/
+
+	/*最后将table_p和field_attr两个数组名返回*/
+	static void *all_arr[2];
+	all_arr[0]=field_attr;
+	all_arr[1]=table_p;
+	return all_arr;
+}
+/*ok报文*/
+int ok(u_char *ok,FILE *fp)
+{
+	//ok指向受影响行数字段
+	unsigned long affected_row=0;
+	if((*ok)<251){
+		affected_row=*ok;
+	}else if((*ok)==0xfc){
+		affected_row=*((short *)(ok+1));//the number in next 2 bytes
+	}else if((*ok)==0xfd){
+		affected_row=(*((int *)(ok+1)))&0xffffff;//the number in next 3 bytes
+	}else{
+		affected_row=*((long *)(ok+1));//the number in next 8 bytes
+	}
+	fprintf(fp,"受影响行数：%ld\n",affected_row);
+	
+}
+
+/*err报文*/
+int error(u_char *err,FILE *fp)
+{
+	/*err指向错误编号*/
+	fprintf(fp,"错误编号：%d",*((short *)err));
+}

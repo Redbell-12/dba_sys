@@ -1,0 +1,681 @@
+#ifndef _TDS_H
+#define _TDS_H
+
+#include <pcap.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <math.h>
+
+/*用于转换date，datetime等与时间有关的数据类型*/
+typedef struct{
+	unsigned short year;
+	unsigned short mon;
+	unsigned short day;
+	unsigned short hour;
+	unsigned short min;
+	unsigned short sec;
+	unsigned short last;
+}TIME;
+
+/*
+ * 原则上应该定义完整的column格式，但目前只用到这两个，所以只定义这两个
+ * 后续如果需要可以再补充
+ */
+typedef struct{
+	int datatype;
+	int scale;//当类型是165，167，231时，此变量中存的就不是scale了，所以此变量的用途并不专一，随类型而定
+}COLUMN;
+
+#endif
+
+
+void *sql_batch_request(u_char *payload)
+{
+        int i;
+        unsigned short sql_length=ntohs(*(short *)(payload+2))-(*(int *)(payload+8))-8;
+        u_char *sql_text=payload+8+(*(int *)(payload+8));
+	u_char *text=malloc(sql_length/2+1);	
+	u_char *p=text;
+        for(i=0;i<sql_length;i+=2){
+		if(*sql_text!='\n'){
+			*p=*sql_text;
+			p++;
+		}
+		sql_text+=2;
+        }   
+	*p='\0';
+	return text;
+}
+void rpc_request(u_char *payload)
+{
+
+}
+
+/*此函数不用*/
+void analysis_column(u_char *column)
+{
+	int i;
+	int column_name_length=*(column+14);
+	u_char *column_name=column+14+1;
+	for(i=0;i<column_name_length;i++){
+		printf("%c",*column_name);
+		column_name+=2;
+	}
+	printf("\n");
+}
+/*
+ * 解析一个row报文，输出其中的各个field值，由于sqlserver中，field类型不同解析方法就不同
+ * 所以analysis_row在解析每个field时要实时参照当前列的类型然后决定解析策略，所以analysis_row
+ * 函数接受三个参数：row报文，记载了各列的类型的数组，列数。另外由于报文中没有给出一个row的长度
+ * 所以analysis_row在解析一个row的同时计算出此row的长度返回给调用者。
+ */
+long analysis_row(u_char *row,const COLUMN *column_attribute,int column_number,FILE *fp)
+{
+	//row指向row报文的数据部分--第一个field，准备解析：先从column_attribute
+	//数组中获得此field的类型，然后调用field_analysis函数，将类型和field指针传给它，它就会解析并输出
+	//field的内容，然后field_analysis返回这个field长度，这里就利用这个长度使row跳向下一个field，然后再次调用
+	//field_analysis函数解析出下一个field内容，如此循环column_number次便解析出了一个row中所有的field
+	int field_length,i;
+	long row_length=0;//用于累计当前解析的row的总长度
+	for(i=0;i<column_number;i++){
+		field_length=field_analysis(row, column_attribute[i].datatype, column_attribute[i].scale, fp);
+		row+=field_length;
+		row_length+=field_length;
+if(i!=column_number-1)fprintf(fp,"&&&");else fprintf(fp,"$$$");
+	}
+	return row_length;
+	
+}
+/*解析一个nbcrow报文*/
+long analysis_nbcrow(u_char *row,const COLUMN *column_attribute,int column_number,FILE *fp)
+{
+	int field_length,i;
+	/*用于累计当前解析的row的总长度*/
+	long row_length=0;
+	/*操作位图的指针*/
+	/*检查位图的方法是：按字节检查。先检查位图的第一字节，当第一字节的8位都检查完了
+ 	就将位图指针移动一个字节指向位图的第二个字节，依次检查完位图的所有字节*/
+	u_char *bitmap=row-1;
+	/*位图所占字节数*/
+	int bytes_of_bitmap=column_number/8+1;
+	/*row跳过位图指向此记录中的第一个field*/
+	row+=bytes_of_bitmap;
+	for(i=0;i<column_number;i++){
+		if((i%8)==0){
+			bitmap++;
+		}
+		if((*bitmap>>(i%8))&0x01){
+			fprintf(fp,"null");
+		}else{
+			field_length=field_analysis(row, column_attribute[i].datatype, column_attribute[i].scale, fp);
+			row+=field_length;
+			row_length+=field_length;
+		}
+if(i!=column_number-1)fprintf(fp,"&&&");else fprintf(fp,"$$$");
+	}
+	/*nbcrow比一般row多一个位图，所以nbcrow的长度应该是各个field的长度+位图长度，
+ 	所以这里把位图长度加上才能使result_set_ms函数中正确跳到下一个row*/
+	return row_length+bytes_of_bitmap;
+	
+}
+	
+void result_set_ms(u_char *columns,u_char *src_ip,u_char *dst_ip,long op_time,u_char *seq_number,u_char *ack_number)
+{
+	FILE *fp=fopen("./sqlserver_outfile","a+");
+	if(fp==NULL){
+		printf("error:open sqlserver_outfile\n");
+		return;
+	}
+	fprintf(fp,"%ld|||%d.%d.%d.%d|||%d.%d.%d.%d|||%d%d%d%d|||%d%d%d%d|||",
+							    op_time,
+			*src_ip,*(src_ip+1),*(src_ip+2),*(src_ip+3),
+			*dst_ip,*(dst_ip+1),*(dst_ip+2),*(dst_ip+3),
+	*seq_number,*(seq_number+1),*(seq_number+2),*(seq_number+3),
+	*ack_number,*(ack_number+1),*(ack_number+2),*(ack_number+3));
+	fprintf(fp,"database_name|||");
+	fprintf(fp,"table_name|||");
+	fprintf(fp,"SAB|||");
+	fprintf(fp,"response|||");
+
+	int i;
+	/*数组元素中依次存放每个列的类型(有某些列还存放了scale)。这里假定一张表中，列的数量不会超过255*/
+  	/*定义成静态是因为analysis_row函数要是用此数组中的值*/
+	static COLUMN column_attribute[255]={{0,0}};
+	/*计算column个数*/
+	unsigned short column_number=(*((unsigned short *)(columns)));
+	u_char *column=columns+2;
+	if((column_number!=0x00)&&(column_number!=0xffff)){
+		for(i=0;i<column_number;i++){
+			/*此循环的任务就是将cloumn指针正确移动到接下来的row报文
+ 			思路就是先移动6个字节，得到此column的类型，然后调用datatype_length
+			函数根据类型判断出此column的总字节数（column字节数随列类型的不同而不同），
+			字节数确定以后就可以顺利将指针移到下一个column。然后循环。如此
+			column_number次，column指针就移动到了row报文了。同时也把column_number
+			个列的类型值放到了column_attribute数组中了。接下去解析row
+			的时候会要用到列的类型。不同的列类型决定了此列的值的长度指示器
+			所占的字节数。也决定了列值是字符型还是二进制型*/
+			column_attribute[i].datatype=*(column+6);
+			/*此句目前为解析time datetime2 timedateoffset三种类型使用，因为解析他们的时候需要用到其cloumn中的scale值，
+ 			详细可见官方手册p41，而其他类型暂时不需要，若后期需要也可加上*/
+			if((*(column+6)==41)||(*(column+6)==42)||(*(column+6)==43)){
+				column_attribute[i].scale=*(column+7);
+			}
+			/*此句为解析decimal和numeric所用，这两个类型也要用到scale，但和time类型的scale并不一样*/
+			if((*(column+6)==106)||(*(column+6)==108)){
+				column_attribute[i].scale=*(column+9);//这里的scale是由用户调整比例决定的
+			}
+			/*3个MAX类型的类型值和其对应的非MAX类型类型值是一样的，如varchar(MAX)的类型值是167，而varchar的类型值也是167
+ 			所以我们碰到167类型的column时要区分是MAX还是非MAX的，区分的点就在largetypesize的值，所以我们这里若碰到这三个
+			类型的column时就将largetypesize的值取到column_attribute[i].scale中，以便field_analysis函数中判断使用*/
+			if((*(column+6)==167)||(*(column+6)==165)||(*(column+6)==231)){
+				column_attribute[i].scale=*((unsigned short *)(column+7));
+			}
+			column+=datatype_length(column+6);
+		}
+	}else{
+		printf("no columns\n");
+		return;
+	}
+	/*所有column过完之后，指针来到row*/
+	u_char *row=column;
+	long row_length;
+	/*如果column报文之后的第一个字节是0xd1，说明是row报文，则解析之*/
+	/*不知道column报文之后除了是row报文还会是什么？还可能是done报文，即这个表目前没有记录
+ 	。还有可能是0xd2，nbcrow报文。还有可能是order报文*/
+	while(1){
+		if(*row==0xd1){//row报文
+			row_length=analysis_row(row+1,column_attribute,column_number,fp);//解析row报文
+			row=row+row_length+1;//跳到下一个row报文
+		}else if(*row==0xd2){//nbcrow报文
+			row_length=analysis_nbcrow(row+1,column_attribute,column_number,fp);//解析nbcrow报文
+			row=row+row_length+1;//跳到下一个row报文
+		}else if(*row==0xa9){//order报文
+			/*跳过order报文*/
+			row+=((*(short *)(row+1))+3);
+		}else if(*row==0xfd){//done报文
+			break;
+		}else{
+			printf("找不到报文类型\n");
+			break;
+		}
+	}
+	fprintf(fp,"\n");
+	fclose(fp);
+}
+	
+void response_ms(u_char *payload, u_char *src_ip, u_char *dst_ip, long op_time, u_char *seq_number, u_char *ack_number)
+{
+	switch(*(payload+8))
+	{
+		case 0x81:result_set_ms(payload+8+1,src_ip,dst_ip,op_time,seq_number,ack_number);break;//跳过0x81字节，指向column个数
+		default:printf("没有匹配到请求命令类型2\n");
+	}
+}
+
+static TIME t;
+/*此函数只有convert_time使用*/
+static int mult10(int n){
+	int sum=10,m;
+	if(n==0)return 1;
+	for(m=1;m<n;m++)sum*=10;
+	return sum;
+}
+TIME * convert_smalldatetime(const void *p)
+{
+	unsigned short year_mon_day=*(short *)p;
+	t.year=1900+year_mon_day/365;
+	t.mon=year_mon_day%365/30;
+	t.day=year_mon_day%365%30;
+	unsigned short hour_min=*(short *)(p+2);
+	t.hour=hour_min/60;
+	t.min=hour_min%60;
+	return &t;
+}
+/*本函数要求处理的时间不早于1900年，1753到1900年的时间没有实现*/
+TIME * convert_datetime(const void *p)
+{
+	/*年月日*/
+	unsigned int year_mon_day=*(int *)p;
+	t.year=1900+year_mon_day/365;
+	t.mon=year_mon_day%365/30;
+	t.day=year_mon_day%365%30;
+	/*时分秒*/
+	unsigned int hour_min_sec=(*(int *)(p+4))/300;//官方手册上规定要先除以300，不知有何意义
+	t.hour=hour_min_sec/3600;
+	t.min=hour_min_sec%3600/60;
+	t.sec=hour_min_sec%3600%60;
+	return &t;
+}
+TIME * convert_date(const void *p)
+{
+	unsigned int year_mon_day=*(int *)p;
+	year_mon_day&=0xffffff;
+	t.year=year_mon_day/365;
+	t.mon=year_mon_day%365/30;
+	t.day=year_mon_day%365%30;
+	return &t;
+}
+TIME * convert_time(const u_char *p,int scale)
+{
+	double field_val;
+	if(0<=scale&&scale<=2){//占3个字节
+		field_val=(*(int *)(p+1))&0xffffff;
+	}else if(3<=scale&&scale<=4){//占4个字节
+		field_val=*(int *)(p+1);
+	}else if(5<=scale&&scale<=7){//占5个字节
+		field_val=(*(long *)(p+1))&0xffffffffff;
+	}
+	int hour_min_sec=(int)(field_val/mult10(scale));	
+	t.hour=hour_min_sec/3600;
+	t.min=hour_min_sec%3600/60;
+	t.sec=hour_min_sec%3600%60;
+	t.last=(int)((field_val/mult10(scale)-(double)hour_min_sec)*mult10(scale));
+	return &t;
+}	
+/*此类型是date和time的组合*/
+TIME * convert_datetime2(const u_char *p,int scale)
+{
+	convert_time(p,scale);
+	p+=(*p-3+1);//指针移到日期部分
+	convert_date(p);
+	return &t;
+}
+	
+/*此类型在datetime2的基础上加上了时区的概念*/
+TIME * convert_datetimeoffset(const void *p)
+{
+	
+}
+
+/*smallmoney*/
+float convert_smallmoney(const void *p)
+{
+	int *money_p=(int *)p;
+	float money=(float)*money_p;
+	money=money/10000;
+	return money;
+}
+/*decimal或numeric*/
+double convert_decimal_numeric(const u_char *p,int scale)
+{
+	/**p可等于5 9 13 17即数据长度就是4 8 12 16四种情况，
+        还有一个字节是用来指示正负的，0是负，1是正
+	把这些长度的值取出来除以10的scale次方就是最终结果	
+	现在的问题是4 8好取用int和long就可以了，但12字节和16字节的怎么取？*/
+	double decimal_numeric=0.0;
+	if(*p==5){
+		decimal_numeric=(float)*(int *)(p+2);
+		decimal_numeric=decimal_numeric/mult10(scale);
+	}else if(*p==9){
+		decimal_numeric=(double)*(long *)(p+2);
+		decimal_numeric=decimal_numeric/mult10(scale);
+	}
+	return decimal_numeric;
+}
+/*
+int main()
+{
+	char arr[]={0x05,0x01,0x10,0x5c,0xc8,0x0d};
+	double f=convert_decimal_numeric(arr,7);
+	//printf("%u/%u/%u %u:%u:%u\n",t->year,t->mon,t->day,t->hour,t->min,t->sec);
+	printf("%f\n",f);
+}
+*/
+
+/*此函数根据某个column的数据类型给出此column的总长度*/
+int datatype_length(const u_char *datatype)
+{
+	if((*datatype)==165||(*datatype)==173)
+		return 7+2+1+(*(datatype+3))*2;
+	else if((*datatype)==167||(*datatype)==175||(*datatype)==231||(*datatype)==239)
+		return 7+7+1+(*(datatype+8))*2;
+	else if((*datatype)==106||(*datatype)==108)
+		return 7+3+1+(*(datatype+4))*2;
+	else if((*datatype)==36||(*datatype)==38||(*datatype)==41||(*datatype)==42
+		||(*datatype)==43||(*datatype)==104||(*datatype)==109||(*datatype)==110||(*datatype)==111)
+		return 7+1+1+(*(datatype+2))*2;
+	else if((*datatype)==40||(*datatype)==56||(*datatype)==127||(*datatype)==48||(*datatype)==52
+		||(*datatype)==50||(*datatype)==62||(*datatype)==59||(*datatype)==60||(*datatype)==122
+		||(*datatype)==61||(*datatype)==58)
+		return 7+0+1+(*(datatype+1))*2;
+	else if((*datatype)==98)
+		return 7+4+1+(*(datatype+5))*2;
+	else if((*datatype)==241)//这一支为什么不归入第4分支呢？因为特殊
+		return 7+1+1+(*(datatype+2))*2;
+	else if((*datatype)==240){
+		u_char *p=(u_char *)datatype+3;
+		int dbname_len=(*p)*2+1;	
+		p=p+dbname_len;
+		int schemaname_len=(*p)*2+1;
+		p=p+schemaname_len;
+		int typename_len=(*p)*2+1;
+		p=p+typename_len;
+		int ass_qua_name_len=(*(short *)p)*2+2;
+		p=p+ass_qua_name_len;
+		int column_name_len=(*p)*2+1;
+		return 7+2+dbname_len+schemaname_len+typename_len+ass_qua_name_len+column_name_len;
+	}else if((*datatype)==34){
+		u_char *p=(u_char *)datatype+6;
+		int tb_name_len=(*(short *)p)*2+2;
+		p=p+tb_name_len;
+		int tb_name2_len=(*(short *)p)*2+2;
+		p=p+tb_name2_len;
+		int column_name_len=(*p)*2+1;
+		return 7+4+1+tb_name_len+tb_name2_len+column_name_len;
+	}else if((*datatype)==35||(*datatype)==99){
+		u_char *p=(u_char *)datatype+11;
+                int tb_name_len=(*(short *)p)*2+2;
+                p=p+tb_name_len;
+                int tb_name2_len=(*(short *)p)*2+2;
+                p=p+tb_name2_len;
+                int column_name_len=(*p)*2+1; 	
+		return 7+4+2+2+1+1+tb_name_len+tb_name2_len+column_name_len;
+	}
+}
+/*int main(){
+	char arr[]={0x00,0x00,0x00,0x00,0x09,0x00,0x63,0xfe,0xff,0xff,0x7f,0x04,0x08,0xd0,0x00,0x00,0x02,0x03,0x00,0x64,0x00,0x62,0x00,0x6f,0x00,0x0c,0x00,0x64,0x00,0x61,0x00,0x74,0x00,0x61,0x00,0x74,0x00,0x79,0x00,0x70,0x00,0x65,0x00,0x5f,0x00,0x61,0x00,0x6c,0x00,0x6c,0x00,0x05,0x6e,0x00,0x74,0x00,0x65,0x00,0x78,0x00,0x74,0x00};
+	char arr1[]={0x00,0x00,0x00,0x00,0x09,0x00,0x6f,0x08,0x08,0x64,0x00,0x61,0x00,0x74,0x00,0x65,0x00,0x74,0x00,0x69,0x00,0x6d,0x00,0x65,0x00};
+	printf("%d\n",datatype_length(arr1+6));
+}*/
+
+
+
+TIME * convert_smalldatetime(const void *);
+TIME * convert_datetime(const void *);
+TIME * convert_date(const void *);
+TIME * convert_time(const u_char *,int);
+TIME * convert_datetime2(const u_char *,int);
+float convert_smallmoney(const void *);
+double convert_decimal_numeric(const u_char *,int);
+
+/*
+ * 接受一个指向field的指针和数据类型，输出出field内容，返回field长度（如果有指示器连同指示器）以便上层函数利用长度来跳到下一个field
+ */
+int field_analysis(u_char *field, int datatype, int scale, FILE *fp)
+{
+	if(datatype==127){
+		fprintf(fp,"%ld",(*(long *)field));
+		return 8;
+	}else if(datatype==56){
+		fprintf(fp,"%d",(*(int *)field));
+		return 4;
+	}else if(datatype==52){
+		fprintf(fp,"%hd",(*(short *)field));
+		return 2;
+	}else if(datatype==48){
+		fprintf(fp,"%d",(*(u_char *)field));
+		return 1;
+	}else if(datatype==60){
+		fprintf(fp,"%ld",(*(long *)field));//money需要转换成金钱的数字格式
+		return 8;
+	}else if(datatype==122){//smallmoney
+		float smallmoney=convert_smallmoney(field);
+		fprintf(fp,"%f",smallmoney);
+		return 4;
+	}else if(datatype==61){//datetime
+		TIME *t=convert_datetime(field);
+		fprintf(fp,"%u/%u/%u %u:%u:%u\n",t->year,t->mon,t->day,t->hour,t->min,t->sec);
+		return 8;
+	}else if(datatype==50){
+		fprintf(fp,"%d",(*(u_char *)field));
+		return 1;
+	}else if(datatype==62){
+		fprintf(fp,"%f",(*(double *)field));//这里的float就是c中的double，所以编程解析此类型数据时直接用一个double类型的变量接就可以了
+		return 8;
+	}else if(datatype==59){
+		fprintf(fp,"%f",(*(float *)field));//这里的real就是c中的float，所以编程解析此类型数据时直接用一个float变量接就可以了
+		return 4;
+	}else if(datatype==58){
+		TIME *t=convert_smalldatetime(field);
+		fprintf(fp,"%u/%u/%u %u:%u",t->year,t->mon,t->day,t->hour,t->min);
+		return 4;
+//以上是没有长度指示器的部分
+	}else if(datatype==38){
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else if(*field==8){
+			fprintf(fp,"%ld",(*(long *)(field+1)));
+			return 1+8;
+		}else if(*field==4){
+			fprintf(fp,"%d",(*(int *)(field+1)));
+			return 1+4;
+		}else if(*field==2){
+			fprintf(fp,"%hd",(*(short *)(field+1)));
+			return 1+2;
+		}else{//(*field==1)
+			fprintf(fp,"%d",(*(u_char *)(field+1)));
+			return 1+1;
+		}
+	}else if(datatype==110){//需要转换成金钱格式
+		if(*field==0){
+                        fprintf(fp,"null");
+			return 1;
+		}else if(*field==8){//money
+                        fprintf(fp,"%ld",(*(long *)(field+1)));
+			return 1+8;
+		}else{//(*field==4)//smallmoney
+			float smallmoney=convert_smallmoney(field+1);
+                        fprintf(fp,"%f",smallmoney);
+			return 1+4;
+		}
+	}else if(datatype==111){
+		if(*field==0){
+                        fprintf(fp,"null");
+			return 1;
+		}else if(*field==8){//datetime
+			TIME *t=convert_datetime(field+1);
+			fprintf(fp,"%u/%u/%u %u:%u:%u",t->year,t->mon,t->day,t->hour,t->min,t->sec);
+			return 1+8;
+		}else{//*field==4//smalldatetime
+			TIME *t=convert_smalldatetime(field+1);
+			fprintf(fp,"%u/%u/%u %u:%u:%u",t->year,t->mon,t->day,t->hour,t->min,t->sec);
+                        return 1+4;
+		}
+	}else if(datatype==104){
+		if(*field==0){
+                        fprintf(fp,"null");
+			return 1;
+		}else{//(*field==1)
+                        fprintf(fp,"%d",(*(u_char *)(field+1)));
+			return 1+1;
+		}
+	}else if(datatype==109){
+                if(*field==0){
+                        fprintf(fp,"null");
+			return 1;
+		}else if(*field==8){
+                        fprintf(fp,"%ld",(*(long *)(field+1)));
+			return 1+8;
+		}else{//(*field==4)
+                        fprintf(fp,"%d",(*(int *)(field+1)));
+			return 1+4;
+		}
+////
+	}else if(datatype==40){//date
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else{
+			TIME *t=convert_date(field+1);
+			fprintf(fp,"%u/%u/%u",t->year,t->mon,t->day);
+			return *field+1;
+		}
+	}else if(datatype==41){//time
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else{
+			TIME *t=convert_time(field,scale);//此处传入的的是field而非field+1，因为convert_time要用到*field
+			fprintf(fp,"%u:%u:%u.%u",t->hour,t->min,t->sec,t->last);
+			return *field+1;
+		}
+	}else if(datatype==42){//datetime2
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else{
+			TIME *t=convert_datetime2(field,scale);
+			fprintf(fp,"%u/%u/%u %u:%u:%u.%u",t->year,t->mon,t->day,t->hour,t->min,t->sec,t->last);
+			return *field+1;
+		}
+	}else if(datatype==43){//datetimeoffset
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else{
+			fprintf(fp,"datetimeoffset");//此处解析datetimeoffset类型数据
+			return *field+1;
+		}
+	}else if(datatype==106||datatype==108){//decimal和numeric
+		if(*field==0){
+			fprintf(fp,"null");
+			return 1;
+		}else{
+			double f=convert_decimal_numeric(field,scale);
+			if(*(field+1)==0){
+				fprintf(fp,"-%f",f);
+			}else{
+				fprintf(fp,"%f",f);
+			}
+			return *field+1;
+		}
+//以下长度指示器变成2字节
+	}else if((datatype==165)&&(scale!=0xffff)){//varbinary
+		if(*(short *)field==0){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			fprintf(fp,"BLOB");
+			return *(short *)field+2;
+		}
+	}else if((datatype==165)&&(scale==0xffff)){//varbinary(MAX)
+		//解析varbinary(MAX)类型的field
+	}else if(datatype==173){//binary
+		if(*(short *)field==0){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			fprintf(fp,"BLOB");
+			return *(short *)field+2;
+		}
+	}else if(datatype==175){//char
+		if(*(short *)field==0||*(short *)field==0xffff){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			int i;
+			u_char *p=field+2;
+			for(i=0;i<(*(short *)field);i++){
+				fprintf(fp,"%c",*p);
+				p++;
+			}
+			return *(short *)field+2;
+		}
+	}else if((datatype==167)&&(scale!=0xffff)){//varchar
+		if(*(short *)field==0||*(short *)field==0xffff){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			int i;
+			u_char *p=field+2;
+			for(i=0;i<(*(short *)field);i++){
+				fprintf(fp,"%c",*p);
+				p++;
+			}
+			return *(short *)field+2;
+		}
+	}else if((datatype==167)&&(scale==0xffff)){//varchar(MAX)
+		//解析varchar(MAX)类型的field
+	}else if(datatype==239){//nchar
+		if(*(short *)field==0){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			int i;
+			u_char *p=field+2;
+			for(i=0;i<(*(short *)field);i+=2){
+				fprintf(fp,"%c",*p);
+				p+=2;
+			}
+			return *(short *)field+2;
+		}
+	}else if((datatype==231)&&(scale!=0xffff)){//nvarchar或sysname
+		if(*(short *)field==0){
+			fprintf(fp,"null");
+			return 2;
+		}else{
+			int i;
+			u_char *p=field+2;
+			for(i=0;i<(*(short *)field);i+=2){
+				fprintf(fp,"%c",*p);
+				p+=2;
+			}
+			return *(short *)field+2;
+		}
+	}else if((datatype==231)&&(scale==0xffff)){//nvarchar(MAX)
+		if(*(long *)field==0){
+                        fprintf(fp,"null");
+                        return 12;
+		}else{
+			int i;
+			int chunk_number=0;
+			u_char *p=field+8;
+			u_char *q;
+			while((*(int *)p)!=0){
+				q=p+4;
+				for(i=0;i<(*(int *)p);i+=2){
+					fprintf(fp,"%c",*q);
+					q+=2;
+				}
+				p+=((*(int *)p)+4);
+				chunk_number++;
+			}
+			chunk_number++;
+			return *(long *)field+chunk_number*4+8;
+		}	
+			
+	}
+}
+
+void print(u_char *text,u_char *src_ip,u_char *dst_ip,long op_time,u_char *seq_number,u_char *ack_number)
+{
+	FILE *fp=fopen("./sqlserver_outfile","a+");
+        if(fp==NULL){
+                printf("error:open sqlserver_outfile\n");
+                return;
+        }
+
+        /*操作时间,源ip,目的ip,序号,确认号*/
+        fprintf(fp,"%ld|||%d.%d.%d.%d|||%d.%d.%d.%d|||%d%d%d%d|||%d%d%d%d|||",
+                                                                    op_time,
+                                *src_ip,*(src_ip+1),*(src_ip+2),*(src_ip+3),
+                                *dst_ip,*(dst_ip+1),*(dst_ip+2),*(dst_ip+3),
+               *seq_number,*(seq_number+1),*(seq_number+2),*(seq_number+3),
+               *ack_number,*(ack_number+1),*(ack_number+2),*(ack_number+3));
+        /*数据库名,表名,用户名,操作类型（sql语句首单词）,操作语句*/
+        fprintf(fp,"database_name|||");
+        fprintf(fp,"table_name|||");
+        fprintf(fp,"SAB|||");
+        /*输出sql语句首单词*/
+        u_char *p=text;
+        while((*p)!=' '){
+                fprintf(fp,"%c",*p);
+                p++;
+        }
+        /*输出整个sql语句*/
+        fprintf(fp,"|||%s",text);
+        fprintf(fp,"\n");
+        /*释放资源*/
+        free(text);
+	fclose(fp);
+}
+
+
